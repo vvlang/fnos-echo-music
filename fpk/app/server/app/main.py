@@ -34,7 +34,7 @@ from .storage import (
 from .transfer import TransferManager
 from .trim_music import TrimMusicRepo
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 GATEWAY_PREFIX = os.environ.get("ECHO_GATEWAY_PREFIX", "").rstrip("/")
@@ -103,6 +103,14 @@ class TransferStartReq(BaseModel):
 class DeviceActionReq(BaseModel):
     mountpoint: str
     rel_path: Optional[str] = None
+
+
+class TransferCancelReq(BaseModel):
+    clear_queue: bool = False
+
+
+class QueueJobReq(BaseModel):
+    job_id: str
 
 
 class DedupCleanReq(BaseModel):
@@ -454,9 +462,31 @@ def api_transfer_status():
 
 
 @app.post("/api/transfer/cancel")
-def api_transfer_cancel():
-    cancelled = transfer_manager.cancel_current()
-    return {"cancelled": cancelled}
+def api_transfer_cancel(req: Optional[TransferCancelReq] = None):
+    clear_q = bool(req.clear_queue) if req else False
+    return transfer_manager.cancel_current(clear_queue=clear_q)
+
+
+@app.post("/api/transfer/queue/remove")
+def api_transfer_queue_remove(req: QueueJobReq):
+    removed = transfer_manager.remove_queued_job(req.job_id)
+    if not removed:
+        raise HTTPException(404, "队列任务不存在或已开始执行")
+    return {"removed": True, "job_id": req.job_id}
+
+
+@app.post("/api/transfer/queue/promote")
+def api_transfer_queue_promote(req: QueueJobReq):
+    ok = transfer_manager.promote_queued_job(req.job_id)
+    if not ok:
+        raise HTTPException(404, "队列任务不存在或已开始执行")
+    return {"promoted": True, "job_id": req.job_id}
+
+
+@app.post("/api/transfer/queue/clear")
+def api_transfer_queue_clear():
+    cleared = transfer_manager.clear_queue()
+    return {"cleared": cleared}
 
 
 # ---------- Library Deduplication & Organization ----------

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Asynchronous background transfer manager for sending fnOS Music tracks to Echo."""
+"""Asynchronous queued background transfer manager for sending fnOS Music tracks to Echo."""
 from __future__ import annotations
 
 import json
@@ -7,8 +7,10 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from .config import ConfigStore, get_data_dir
 from .media_proc import (
@@ -84,11 +86,24 @@ def build_destination_path(
     return os.path.join(mount_root, base_subdir, artist_dir, album_dir, filename)
 
 
+@dataclass
+class _QueuedTask:
+    job: Dict[str, Any]
+    repo: TrimMusicRepo
+    tracks: List[Dict[str, Any]]
+    mount_root: str
+    cfg: Dict[str, Any]
+    playlist_name: Optional[str]
+    user_id: int
+
+
 class TransferManager:
     def __init__(self, cfg_store: ConfigStore):
         self._cfg_store = cfg_store
         self._lock = threading.Lock()
         self._current_job: Optional[Dict[str, Any]] = None
+        self._queue: Deque[_QueuedTask] = deque()
+        self._worker_running = False
         self._cancel_event = threading.Event()
         self._history_path = get_data_dir() / "history.json"
         self._history: List[Dict[str, Any]] = self._load_history()
@@ -111,20 +126,71 @@ class TransferManager:
         except OSError:
             pass
 
+    def _queue_snapshot_unlocked(self) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for pos, task in enumerate(self._queue, start=1):
+            j = task.job
+            items.append(
+                {
+                    "id": j["id"],
+                    "position": pos,
+                    "label": j["label"],
+                    "mountpoint": j["mountpoint"],
+                    "device_label": j["device_label"],
+                    "playlist_name": j["playlist_name"],
+                    "status": "queued",
+                    "created_at": j["created_at"],
+                    "total_tracks": j["total_tracks"],
+                    "total_bytes": j["total_bytes"],
+                }
+            )
+        return items
+
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
             return {
                 "current": dict(self._current_job) if self._current_job else None,
+                "queue": self._queue_snapshot_unlocked(),
                 "history": list(self._history[:20]),
             }
 
-    def cancel_current(self) -> bool:
+    def cancel_current(self, clear_queue: bool = False) -> Dict[str, Any]:
         with self._lock:
+            cleared = 0
+            if clear_queue:
+                cleared = len(self._queue)
+                self._queue.clear()
+            cancelled = False
             if self._current_job and self._current_job["status"] == "running":
                 self._cancel_event.set()
                 self._current_job["cancelling"] = True
-                return True
-        return False
+                cancelled = True
+            return {"cancelled": cancelled, "cleared_queue": cleared}
+
+    def remove_queued_job(self, job_id: str) -> bool:
+        with self._lock:
+            for idx, task in enumerate(self._queue):
+                if task.job["id"] == job_id:
+                    del self._queue[idx]
+                    return True
+            return False
+
+    def promote_queued_job(self, job_id: str) -> bool:
+        """Move a queued job to the front of the waiting queue so it runs next."""
+        with self._lock:
+            for idx, task in enumerate(self._queue):
+                if task.job["id"] == job_id:
+                    if idx > 0:
+                        del self._queue[idx]
+                        self._queue.appendleft(task)
+                    return True
+            return False
+
+    def clear_queue(self) -> int:
+        with self._lock:
+            n = len(self._queue)
+            self._queue.clear()
+            return n
 
     def start_job(
         self,
@@ -150,267 +216,310 @@ class TransferManager:
                 if k in cfg:
                     cfg[k] = v
 
-        with self._lock:
-            if self._current_job and self._current_job["status"] == "running":
-                raise RuntimeError("当前已有传输任务正在进行，请等待完成或先取消")
-            self._cancel_event.clear()
-            total_bytes = sum(t.get("size", 0) for t in tracks)
-            job: Dict[str, Any] = {
-                "id": uuid.uuid4().hex[:12],
-                "label": label,
-                "mountpoint": dev["mountpoint"],
-                "device_label": dev["label"],
-                "playlist_name": playlist_name,
-                "status": "running",
-                "cancelling": False,
-                "started_at": int(time.time()),
-                "finished_at": None,
-                "total_tracks": len(tracks),
-                "processed_tracks": 0,
-                "copied": 0,
-                "skipped": 0,
-                "transcoded": 0,
-                "failed": 0,
-                "covers_written": 0,
-                "lyrics_written": 0,
-                "total_bytes": total_bytes,
-                "transferred_bytes": 0,
-                "speed_bps": 0,
-                "current_track": None,
-                "errors": [],
-                "recent_items": [],
-            }
-            self._current_job = job
+        now = int(time.time())
+        total_bytes = sum(t.get("size", 0) for t in tracks)
+        job: Dict[str, Any] = {
+            "id": uuid.uuid4().hex[:12],
+            "label": label,
+            "mountpoint": dev["mountpoint"],
+            "device_label": dev["label"],
+            "playlist_name": playlist_name,
+            "status": "queued",
+            "cancelling": False,
+            "created_at": now,
+            "started_at": None,
+            "finished_at": None,
+            "total_tracks": len(tracks),
+            "processed_tracks": 0,
+            "copied": 0,
+            "skipped": 0,
+            "transcoded": 0,
+            "failed": 0,
+            "covers_written": 0,
+            "lyrics_written": 0,
+            "total_bytes": total_bytes,
+            "transferred_bytes": 0,
+            "speed_bps": 0,
+            "current_track": None,
+            "errors": [],
+            "recent_items": [],
+        }
 
-        worker = threading.Thread(
-            target=self._run_job,
-            args=(job["id"], repo, tracks, dev["mountpoint"], cfg, playlist_name, user_id),
-            daemon=True,
+        task = _QueuedTask(
+            job=job,
+            repo=repo,
+            tracks=tracks,
+            mount_root=dev["mountpoint"],
+            cfg=cfg,
+            playlist_name=playlist_name,
+            user_id=user_id,
         )
-        worker.start()
-        return dict(job)
 
-    def _run_job(
-        self,
-        job_id: str,
-        repo: TrimMusicRepo,
-        tracks: List[Dict[str, Any]],
-        mount_root: str,
-        cfg: Dict[str, Any],
-        playlist_name: Optional[str],
-        user_id: int,
-    ) -> None:
+        with self._lock:
+            is_busy = bool(self._current_job and self._current_job["status"] == "running") or self._worker_running
+            self._queue.append(task)
+            queue_position = len(self._queue) if is_busy else 0
+            should_spawn = not self._worker_running
+            if should_spawn:
+                self._worker_running = True
+
+        if should_spawn:
+            threading.Thread(target=self._dispatcher_loop, daemon=True).start()
+
+        resp = dict(job)
+        resp["queued"] = is_busy
+        resp["queue_position"] = queue_position
+        if not is_busy:
+            resp["status"] = "running"
+        return resp
+
+    def _dispatcher_loop(self) -> None:
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._worker_running = False
+                    return
+                task = self._queue.popleft()
+                self._cancel_event.clear()
+                task.job["status"] = "running"
+                task.job["started_at"] = int(time.time())
+                self._current_job = task.job
+
+            self._run_task(task)
+
+    def _run_task(self, task: _QueuedTask) -> None:
+        job_id = task.job["id"]
+        repo = task.repo
+        tracks = task.tracks
+        mount_root = task.mount_root
+        cfg = task.cfg
+        playlist_name = task.playlist_name
+        user_id = task.user_id
+
         t0 = time.monotonic()
         cover_cache: Dict[str, Tuple[bytes, int, int]] = {}
         written_folder_covers: set[str] = set()
         copied_cue_sources: set[str] = set()
         playlist_rel_entries: List[str] = []
 
-        for idx, track in enumerate(tracks, start=1):
-            if self._cancel_event.is_set():
-                break
-
-            src_path = track.get("path") or ""
+        # Re-check mount availability in case device was unplugged while queued
+        mount_ok = True
+        try:
+            dev = validate_mount_path(mount_root)
+            if not dev.get("writable"):
+                raise PermissionError(f"目标设备不可写: {mount_root}")
+        except Exception as exc:
+            mount_ok = False
             with self._lock:
                 if self._current_job and self._current_job["id"] == job_id:
-                    self._current_job["current_track"] = {
-                        "id": track["id"],
-                        "title": track["title"],
-                        "artist": track["artist"],
-                        "album": track["album"],
-                        "suffix": track["suffix"],
-                        "cover_type": track["cover_type"],
-                        "cover_guid": track["cover_guid"],
-                        "index": idx,
-                    }
+                    self._current_job["failed"] = len(tracks)
+                    self._current_job["processed_tracks"] = len(tracks)
+                    self._current_job["errors"].append({"track_id": 0, "title": "目标设备异常", "error": str(exc)[:240]})
 
-            item_log: Dict[str, Any] = {
-                "track_id": track["id"],
-                "title": track["title"],
-                "artist": track["artist"],
-                "status": "ok",
-                "cover": False,
-                "lyric": False,
-                "tags": False,
-                "note": "",
-            }
+        if mount_ok:
+            for idx, track in enumerate(tracks, start=1):
+                if self._cancel_event.is_set():
+                    break
 
-            try:
-                if not os.path.isfile(src_path):
-                    raise FileNotFoundError(f"源文件不存在: {src_path}")
+                src_path = track.get("path") or ""
+                with self._lock:
+                    if self._current_job and self._current_job["id"] == job_id:
+                        self._current_job["current_track"] = {
+                            "id": track["id"],
+                            "title": track["title"],
+                            "artist": track["artist"],
+                            "album": track["album"],
+                            "suffix": track["suffix"],
+                            "cover_type": track["cover_type"],
+                            "cover_guid": track["cover_guid"],
+                            "index": idx,
+                        }
 
-                is_cue = bool(track.get("is_cue"))
-                cue_split = is_cue and cfg.get("cue_mode", "split_flac") == "split_flac"
-                will_transcode = cue_split or needs_transcode(
-                    track.get("suffix", ""), cfg.get("transcode_unsupported", True)
-                )
+                item_log: Dict[str, Any] = {
+                    "track_id": track["id"],
+                    "title": track["title"],
+                    "artist": track["artist"],
+                    "status": "ok",
+                    "cover": False,
+                    "lyric": False,
+                    "tags": False,
+                    "note": "",
+                }
 
-                dst_path = build_destination_path(mount_root, track, cfg, force_flac=will_transcode)
-                dst_dir = os.path.dirname(dst_path)
-                os.makedirs(dst_dir, exist_ok=True)
+                try:
+                    if not os.path.isfile(src_path):
+                        raise FileNotFoundError(f"源文件不存在: {src_path}")
 
-                # Resolve cover from trim.music
-                cover_jpeg: Optional[bytes] = None
-                cover_dims = (500, 500)
-                if cfg.get("embed_cover", True) or cfg.get("write_folder_cover", True):
-                    cpath, _ = repo.resolve_cover_file(
-                        track.get("track_cover_guid"),
-                        track.get("album_cover_guid"),
-                        track.get("album_metadata_mode"),
-                        src_path,
+                    is_cue = bool(track.get("is_cue"))
+                    cue_split = is_cue and cfg.get("cue_mode", "split_flac") == "split_flac"
+                    will_transcode = cue_split or needs_transcode(
+                        track.get("suffix", ""), cfg.get("transcode_unsupported", True)
                     )
-                    if cpath:
-                        if cpath not in cover_cache:
-                            try:
-                                cover_cache[cpath] = prepare_echo_cover(
-                                    cpath,
-                                    max_size=int(cfg.get("cover_max_size", 500)),
-                                    quality=int(cfg.get("cover_quality", 88)),
-                                )
-                            except Exception:
-                                cover_cache[cpath] = (b"", 0, 0)
-                        cached = cover_cache[cpath]
-                        if cached[0]:
-                            cover_jpeg, cover_dims = cached[0], (cached[1], cached[2])
 
-                # Resolve lyric from trim.music
-                lyric_text: Optional[str] = None
-                if cfg.get("export_lrc", True) or cfg.get("embed_lyrics", True):
-                    linfo = repo.resolve_lyric(track["id"], user_id=user_id)
-                    if linfo and linfo.get("content"):
-                        lyric_text = linfo["content"]
+                    dst_path = build_destination_path(mount_root, track, cfg, force_flac=will_transcode)
+                    dst_dir = os.path.dirname(dst_path)
+                    os.makedirs(dst_dir, exist_ok=True)
 
-                # Copy or transcode audio file
-                skip_existing = bool(cfg.get("skip_existing", True))
-                already_exists = os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0
-                bytes_done = 0
+                    # Resolve cover from trim.music
+                    cover_jpeg: Optional[bytes] = None
+                    cover_dims = (500, 500)
+                    if cfg.get("embed_cover", True) or cfg.get("write_folder_cover", True):
+                        cpath, _ = repo.resolve_cover_file(
+                            track.get("track_cover_guid"),
+                            track.get("album_cover_guid"),
+                            track.get("album_metadata_mode"),
+                            src_path,
+                        )
+                        if cpath:
+                            if cpath not in cover_cache:
+                                try:
+                                    cover_cache[cpath] = prepare_echo_cover(
+                                        cpath,
+                                        max_size=int(cfg.get("cover_max_size", 500)),
+                                        quality=int(cfg.get("cover_quality", 88)),
+                                    )
+                                except Exception:
+                                    cover_cache[cpath] = (b"", 0, 0)
+                            cached = cover_cache[cpath]
+                            if cached[0]:
+                                cover_jpeg, cover_dims = cached[0], (cached[1], cached[2])
 
-                if is_cue and not cue_split:
-                    # Copy whole CUE audio + .cue once
-                    cue_key = src_path
-                    if cue_key not in copied_cue_sources:
-                        if already_exists and skip_existing:
-                            item_log["status"] = "skipped"
-                            item_log["note"] = "已存在"
+                    # Resolve lyric from trim.music
+                    lyric_text: Optional[str] = None
+                    if cfg.get("export_lrc", True) or cfg.get("embed_lyrics", True):
+                        linfo = repo.resolve_lyric(track["id"], user_id=user_id)
+                        if linfo and linfo.get("content"):
+                            lyric_text = linfo["content"]
+
+                    # Copy or transcode audio file
+                    skip_existing = bool(cfg.get("skip_existing", True))
+                    already_exists = os.path.isfile(dst_path) and os.path.getsize(dst_path) > 0
+                    bytes_done = 0
+
+                    if is_cue and not cue_split:
+                        cue_key = src_path
+                        if cue_key not in copied_cue_sources:
+                            if already_exists and skip_existing:
+                                item_log["status"] = "skipped"
+                                item_log["note"] = "已存在"
+                            else:
+                                bytes_done = copy_file_atomic(src_path, dst_path, self._cancel_event.is_set)
+                            cue_src = track.get("cue_path")
+                            if cue_src and os.path.isfile(cue_src):
+                                cue_dst = os.path.splitext(dst_path)[0] + ".cue"
+                                if not (os.path.isfile(cue_dst) and skip_existing):
+                                    copy_file_atomic(cue_src, cue_dst, self._cancel_event.is_set)
+                            copied_cue_sources.add(cue_key)
                         else:
-                            bytes_done = copy_file_atomic(src_path, dst_path, self._cancel_event.is_set)
-                        cue_src = track.get("cue_path")
-                        if cue_src and os.path.isfile(cue_src):
-                            cue_dst = os.path.splitext(dst_path)[0] + ".cue"
-                            if not (os.path.isfile(cue_dst) and skip_existing):
-                                copy_file_atomic(cue_src, cue_dst, self._cancel_event.is_set)
-                        copied_cue_sources.add(cue_key)
-                    else:
+                            item_log["status"] = "skipped"
+                            item_log["note"] = "整轨已复制"
+                    elif already_exists and skip_existing:
                         item_log["status"] = "skipped"
-                        item_log["note"] = "整轨已复制"
-                elif already_exists and skip_existing:
-                    item_log["status"] = "skipped"
-                    item_log["note"] = "已存在(仅补齐封面/歌词)"
-                elif will_transcode:
-                    bytes_done = transcode_or_split_to_flac(
-                        src_path,
-                        dst_path,
-                        start_ms=track.get("start_offset_ms") if cue_split else None,
-                        end_ms=track.get("end_offset_ms") if cue_split else None,
-                    )
-                    item_log["status"] = "transcoded"
-                    item_log["note"] = "CUE分轨FLAC" if cue_split else "转码FLAC"
-                else:
-                    bytes_done = copy_file_atomic(src_path, dst_path, self._cancel_event.is_set)
-                    item_log["status"] = "copied"
+                        item_log["note"] = "已存在(仅补齐封面/歌词)"
+                    elif will_transcode:
+                        bytes_done = transcode_or_split_to_flac(
+                            src_path,
+                            dst_path,
+                            start_ms=track.get("start_offset_ms") if cue_split else None,
+                            end_ms=track.get("end_offset_ms") if cue_split else None,
+                        )
+                        item_log["status"] = "transcoded"
+                        item_log["note"] = "CUE分轨FLAC" if cue_split else "转码FLAC"
+                    else:
+                        bytes_done = copy_file_atomic(src_path, dst_path, self._cancel_event.is_set)
+                        item_log["status"] = "copied"
 
-                # Write folder.jpg once per album folder
-                if cover_jpeg and cfg.get("write_folder_cover", True) and dst_dir not in written_folder_covers:
-                    if write_folder_cover(dst_dir, cover_jpeg, overwrite=not skip_existing):
-                        item_log["cover"] = True
-                    written_folder_covers.add(dst_dir)
+                    # Write folder.jpg once per album folder
+                    if cover_jpeg and cfg.get("write_folder_cover", True) and dst_dir not in written_folder_covers:
+                        if write_folder_cover(dst_dir, cover_jpeg, overwrite=not skip_existing):
+                            item_log["cover"] = True
+                        written_folder_covers.add(dst_dir)
 
-                # Write tags + embedded cover + embedded lyrics on freshly copied/transcoded files
-                if item_log["status"] in ("copied", "transcoded"):
-                    meta_res = apply_metadata_to_copy(
-                        dst_path,
-                        track,
-                        cover_jpeg=cover_jpeg,
-                        cover_dims=cover_dims,
-                        lyric_text=lyric_text,
-                        write_tags=bool(cfg.get("write_scraped_tags", True)),
-                        embed_cover=bool(cfg.get("embed_cover", True)),
-                        embed_lyrics=bool(cfg.get("embed_lyrics", True)),
-                    )
-                    item_log["tags"] = meta_res["tags"]
-                    item_log["cover"] = item_log["cover"] or meta_res["cover"]
+                    # Write tags + embedded cover + embedded lyrics on freshly copied/transcoded files
+                    if item_log["status"] in ("copied", "transcoded"):
+                        meta_res = apply_metadata_to_copy(
+                            dst_path,
+                            track,
+                            cover_jpeg=cover_jpeg,
+                            cover_dims=cover_dims,
+                            lyric_text=lyric_text,
+                            write_tags=bool(cfg.get("write_scraped_tags", True)),
+                            embed_cover=bool(cfg.get("embed_cover", True)),
+                            embed_lyrics=bool(cfg.get("embed_lyrics", True)),
+                        )
+                        item_log["tags"] = meta_res["tags"]
+                        item_log["cover"] = item_log["cover"] or meta_res["cover"]
 
-                # Always ensure sidecar .lrc exists if enabled
-                if lyric_text and cfg.get("export_lrc", True):
-                    lrc_dst = os.path.splitext(dst_path)[0] + ".lrc"
-                    if not (skip_existing and os.path.isfile(lrc_dst) and os.path.getsize(lrc_dst) > 0):
-                        write_lrc_sidecar(dst_path, lyric_text)
-                        item_log["lyric"] = True
+                    # Always ensure sidecar .lrc exists if enabled
+                    if lyric_text and cfg.get("export_lrc", True):
+                        lrc_dst = os.path.splitext(dst_path)[0] + ".lrc"
+                        if not (skip_existing and os.path.isfile(lrc_dst) and os.path.getsize(lrc_dst) > 0):
+                            write_lrc_sidecar(dst_path, lyric_text)
+                            item_log["lyric"] = True
 
-                rel_for_m3u = os.path.relpath(dst_path, mount_root).replace(os.sep, "/")
-                playlist_rel_entries.append(rel_for_m3u)
+                    rel_for_m3u = os.path.relpath(dst_path, mount_root).replace(os.sep, "/")
+                    playlist_rel_entries.append(rel_for_m3u)
 
-                with self._lock:
-                    if self._current_job and self._current_job["id"] == job_id:
-                        self._current_job["processed_tracks"] += 1
-                        self._current_job["transferred_bytes"] += bytes_done
-                        elapsed = max(0.05, time.monotonic() - t0)
-                        self._current_job["speed_bps"] = int(self._current_job["transferred_bytes"] / elapsed)
-                        if item_log["status"] == "copied":
-                            self._current_job["copied"] += 1
-                        elif item_log["status"] == "transcoded":
-                            self._current_job["transcoded"] += 1
-                        elif item_log["status"] == "skipped":
-                            self._current_job["skipped"] += 1
-                        if item_log["cover"]:
-                            self._current_job["covers_written"] += 1
-                        if item_log["lyric"]:
-                            self._current_job["lyrics_written"] += 1
-                        self._current_job["recent_items"] = (
-                            [item_log] + self._current_job["recent_items"]
-                        )[:30]
+                    with self._lock:
+                        if self._current_job and self._current_job["id"] == job_id:
+                            self._current_job["processed_tracks"] += 1
+                            self._current_job["transferred_bytes"] += bytes_done
+                            elapsed = max(0.05, time.monotonic() - t0)
+                            self._current_job["speed_bps"] = int(self._current_job["transferred_bytes"] / elapsed)
+                            if item_log["status"] == "copied":
+                                self._current_job["copied"] += 1
+                            elif item_log["status"] == "transcoded":
+                                self._current_job["transcoded"] += 1
+                            elif item_log["status"] == "skipped":
+                                self._current_job["skipped"] += 1
+                            if item_log["cover"]:
+                                self._current_job["covers_written"] += 1
+                            if item_log["lyric"]:
+                                self._current_job["lyrics_written"] += 1
+                            self._current_job["recent_items"] = (
+                                [item_log] + self._current_job["recent_items"]
+                            )[:30]
 
-            except InterruptedError:
-                break
-            except Exception as exc:
-                item_log["status"] = "failed"
-                item_log["note"] = str(exc)[:200]
-                with self._lock:
-                    if self._current_job and self._current_job["id"] == job_id:
-                        self._current_job["processed_tracks"] += 1
-                        self._current_job["failed"] += 1
-                        if len(self._current_job["errors"]) < 50:
-                            self._current_job["errors"].append(
-                                {"track_id": track["id"], "title": track["title"], "error": str(exc)[:240]}
-                            )
-                        self._current_job["recent_items"] = (
-                            [item_log] + self._current_job["recent_items"]
-                        )[:30]
+                except InterruptedError:
+                    break
+                except Exception as exc:
+                    item_log["status"] = "failed"
+                    item_log["note"] = str(exc)[:200]
+                    with self._lock:
+                        if self._current_job and self._current_job["id"] == job_id:
+                            self._current_job["processed_tracks"] += 1
+                            self._current_job["failed"] += 1
+                            if len(self._current_job["errors"]) < 50:
+                                self._current_job["errors"].append(
+                                    {"track_id": track["id"], "title": track["title"], "error": str(exc)[:240]}
+                                )
+                            self._current_job["recent_items"] = (
+                                [item_log] + self._current_job["recent_items"]
+                            )[:30]
 
-        # Optionally generate .m3u8 playlist on Echo
-        if playlist_name and playlist_rel_entries and cfg.get("generate_m3u", True) and not self._cancel_event.is_set():
-            try:
-                pl_subdir = (cfg.get("target_playlist_subdir", "Playlists") or "Playlists").strip("/")
-                pl_dir = os.path.join(mount_root, pl_subdir)
-                os.makedirs(pl_dir, exist_ok=True)
-                pl_file = os.path.join(pl_dir, f"{sanitize_filename(playlist_name)}.m3u8")
-                # Relative paths from Playlists/ back to root (../Music/...)
-                depth = len(Path(pl_subdir).parts)
-                prefix = "../" * depth
-                lines = ["#EXTM3U"] + [f"{prefix}{entry}" for entry in playlist_rel_entries]
-                tmp = pl_file + ".tmp_echo"
-                with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-                    fh.write("\n".join(lines) + "\n")
-                os.replace(tmp, pl_file)
-            except Exception:
-                pass
+            # Optionally generate .m3u8 playlist on Echo
+            if playlist_name and playlist_rel_entries and cfg.get("generate_m3u", True) and not self._cancel_event.is_set():
+                try:
+                    pl_subdir = (cfg.get("target_playlist_subdir", "Playlists") or "Playlists").strip("/")
+                    pl_dir = os.path.join(mount_root, pl_subdir)
+                    os.makedirs(pl_dir, exist_ok=True)
+                    pl_file = os.path.join(pl_dir, f"{sanitize_filename(playlist_name)}.m3u8")
+                    depth = len(Path(pl_subdir).parts)
+                    prefix = "../" * depth
+                    lines = ["#EXTM3U"] + [f"{prefix}{entry}" for entry in playlist_rel_entries]
+                    tmp = pl_file + ".tmp_echo"
+                    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write("\n".join(lines) + "\n")
+                    os.replace(tmp, pl_file)
+                except Exception:
+                    pass
 
-        # Flush USB storage cache automatically
-        if cfg.get("auto_sync_disk", True):
-            try:
-                sync_mount(mount_root)
-            except Exception:
-                pass
+            # Flush USB storage cache automatically
+            if cfg.get("auto_sync_disk", True):
+                try:
+                    sync_mount(mount_root)
+                except Exception:
+                    pass
 
         with self._lock:
             if self._current_job and self._current_job["id"] == job_id:

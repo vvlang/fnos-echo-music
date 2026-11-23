@@ -39,7 +39,7 @@
     selectedTracks: new Map(),
     currentPageItems: [],
     // Transfer polling
-    transferStatus: { current: null, history: [] },
+    transferStatus: { current: null, queue: [], history: [] },
     pollTimer: null,
     // Dedup & Organize state
     dedupMode: "exact_hash",
@@ -259,7 +259,7 @@
   // ---------- Transfer Actions ----------
   async function startTransfer(payload) {
     const dev = requireDevice();
-    if (!dev) return;
+    if (!dev) return false;
     try {
       const job = await api("/api/transfer/start", {
         method: "POST",
@@ -269,28 +269,57 @@
           ...payload,
         }),
       });
-      toast(`已开始任务：${job.label}（共 ${job.total_tracks} 首）`, "ok");
+      if (job.queued) {
+        toast(`已加入发送队列（第 ${job.queue_position} 位）：${job.label}（共 ${job.total_tracks} 首）`, "info");
+      } else {
+        toast(`已开始任务：${job.label}（共 ${job.total_tracks} 首）`, "ok");
+      }
       await pollTransferStatus();
+      return true;
     } catch (e) {
       toast(e.message, "error");
+      return false;
     }
   }
 
   async function pollTransferStatus() {
     try {
       const data = await api("/api/transfer/status");
-      const prevRunning = state.transferStatus.current?.status === "running";
+      const prevCur = state.transferStatus.current;
+      const prevRunningId = prevCur?.status === "running" ? prevCur.id : null;
       state.transferStatus = data;
       const cur = data.current;
+      const queue = data.queue || [];
       const banner = document.getElementById("transfer-banner");
       const badge = document.getElementById("badge-transfer-active");
+
+      // Notify when a previous running job finished (even if the next queued job already started)
+      if (prevRunningId && (!cur || cur.id !== prevRunningId || cur.status !== "running")) {
+        const finished =
+          cur && cur.id === prevRunningId
+            ? cur
+            : (data.history || []).find((h) => h.id === prevRunningId);
+        if (finished) {
+          if (finished.status === "completed") {
+            toast(
+              `「${finished.label}」传输完成！复制 ${finished.copied} / 转码 ${finished.transcoded} / 跳过 ${finished.skipped}，封面 ${finished.covers_written}，歌词 ${finished.lyrics_written}`,
+              "ok"
+            );
+          } else if (finished.status === "cancelled") {
+            toast(`「${finished.label}」已取消`, "warn");
+          }
+          refreshDevices(true);
+        }
+      }
 
       if (cur && cur.status === "running") {
         banner.classList.remove("hidden");
         badge.classList.remove("hidden");
+        badge.textContent = queue.length > 0 ? `传输中 +${queue.length}` : "传输中";
         const pct = cur.total_tracks > 0 ? Math.round((cur.processed_tracks / cur.total_tracks) * 100) : 0;
+        const qSuffix = queue.length > 0 ? ` · 队列等待 ${queue.length} 项` : "";
         document.getElementById("tb-title").textContent =
-          `${cur.label} → ${cur.device_label} (${cur.processed_tracks}/${cur.total_tracks})`;
+          `${cur.label} → ${cur.device_label} (${cur.processed_tracks}/${cur.total_tracks})${qSuffix}`;
         const curName = cur.current_track ? `${cur.current_track.title} - ${cur.current_track.artist}` : "准备中...";
         document.getElementById("tb-sub").textContent =
           `当前：${curName} · 速度 ${fmtBytes(cur.speed_bps)}/s · 封面 ${cur.covers_written} · 歌词 ${cur.lyrics_written}`;
@@ -298,17 +327,11 @@
         document.getElementById("tb-pct").textContent = `${pct}%`;
       } else {
         banner.classList.add("hidden");
-        badge.classList.add("hidden");
-        if (prevRunning && cur) {
-          if (cur.status === "completed") {
-            toast(
-              `传输完成！复制 ${cur.copied} / 转码 ${cur.transcoded} / 跳过 ${cur.skipped}，封面 ${cur.covers_written}，歌词 ${cur.lyrics_written}`,
-              "ok"
-            );
-          } else if (cur.status === "cancelled") {
-            toast("传输任务已取消", "warn");
-          }
-          refreshDevices(true);
+        if (queue.length > 0) {
+          badge.classList.remove("hidden");
+          badge.textContent = `排队 ${queue.length}`;
+        } else {
+          badge.classList.add("hidden");
         }
       }
 
@@ -1089,9 +1112,9 @@
 
   function renderTransfersView() {
     const root = document.getElementById("content-area");
-    const { current, history } = state.transferStatus;
+    const { current, queue = [], history = [] } = state.transferStatus;
 
-    let curHTML = `<div class="empty-state"><h3>当前没有正在进行的传输任务</h3><p>在曲库中选择喜欢的歌曲、专辑或歌单，点击「发送到 Echo」即可开始传输</p></div>`;
+    let curHTML = `<div class="empty-state"><h3>当前没有正在进行的传输任务</h3><p>在曲库中选择喜欢的歌曲、专辑或歌单，点击「发送到 Echo」即可开始传输；传输进行中仍可继续点发送加入排队</p></div>`;
     if (current) {
       const pct = current.total_tracks > 0 ? Math.round((current.processed_tracks / current.total_tracks) * 100) : 0;
       const statusBadge =
@@ -1119,7 +1142,14 @@
               <strong style="font-size:15px">${esc(current.label)}</strong> ${statusBadge}
               <div style="font-size:12px;color:var(--text-dim);margin-top:3px">目标设备：${esc(current.device_label)} (${esc(current.mountpoint)})</div>
             </div>
-            ${current.status === "running" ? `<button class="btn btn-danger btn-sm" id="btn-tr-cancel">取消任务</button>` : ""}
+            ${
+              current.status === "running"
+                ? `<div class="view-actions">
+                    <button class="btn btn-danger btn-sm" id="btn-tr-cancel">取消当前</button>
+                    ${queue.length > 0 ? `<button class="btn btn-danger btn-sm" id="btn-tr-cancel-all">全部停止</button>` : ""}
+                  </div>`
+                : ""
+            }
           </div>
           <div class="disk-bar" style="height:10px;margin:14px 0 6px"><div class="disk-fill" style="width:${pct}%"></div></div>
           <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-dim)">
@@ -1145,6 +1175,47 @@
         </div>`;
     }
 
+    let queueHTML = "";
+    if (queue.length > 0) {
+      const qRows = queue
+        .map(
+          (q, idx) => `
+          <tr>
+            <td style="width:48px"><span class="tag tag-blue">#${q.position}</span></td>
+            <td>
+              <strong>${esc(q.label)}</strong>
+              <div style="font-size:11.5px;color:var(--text-muted)">入队时间：${fmtTime(q.created_at)}</div>
+            </td>
+            <td>${esc(q.device_label)}</td>
+            <td>${q.total_tracks} 首</td>
+            <td>${fmtBytes(q.total_bytes)}</td>
+            <td style="text-align:right;white-space:nowrap">
+              ${idx > 0 ? `<button class="btn btn-ghost btn-sm" data-q-promote="${esc(q.id)}" title="移至队首，下一项优先发送">优先</button>` : ""}
+              <button class="btn btn-danger btn-sm" data-q-remove="${esc(q.id)}">移除</button>
+            </td>
+          </tr>`
+        )
+        .join("");
+
+      queueHTML = `
+        <div class="transfer-card" style="border-color:rgba(91,140,255,0.35)">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">
+            <div>
+              <strong style="font-size:15px">📋 待发送队列</strong>
+              <span class="tag tag-blue" style="margin-left:6px">等待中 ${queue.length} 项</span>
+              <div style="font-size:12px;color:var(--text-dim);margin-top:2px">当前任务完成后自动按顺序依次发送，传输期间可随时继续添加新任务</div>
+            </div>
+            <button class="btn btn-danger btn-sm" id="btn-q-clear">清空队列</button>
+          </div>
+          <div class="track-table-wrap">
+            <table class="track-table">
+              <thead><tr><th>顺位</th><th>任务</th><th>目标设备</th><th>曲目数</th><th>预计大小</th><th style="text-align:right">操作</th></tr></thead>
+              <tbody>${qRows}</tbody>
+            </table>
+          </div>
+        </div>`;
+    }
+
     const histRows = (history || [])
       .map(
         (h) => `
@@ -1161,11 +1232,12 @@
     root.innerHTML = `
       <div class="view-header">
         <div>
-          <h1 class="view-title">传输任务与历史记录</h1>
-          <div class="view-subtitle">实时查看音频、飞牛刮削封面与歌词的写入进度</div>
+          <h1 class="view-title">传输队列与历史记录</h1>
+          <div class="view-subtitle">支持多任务连续排队发送，实时查看音频、飞牛刮削封面与歌词的写入进度</div>
         </div>
       </div>
       ${curHTML}
+      ${queueHTML}
       <h3 style="margin:20px 0 10px;font-size:15px">历史传输记录</h3>
       ${
         histRows
@@ -1179,10 +1251,55 @@
     const cBtn = root.querySelector("#btn-tr-cancel");
     if (cBtn) {
       cBtn.onclick = async () => {
-        await api("/api/transfer/cancel", { method: "POST" });
-        toast("正在取消传输...", "warn");
+        await api("/api/transfer/cancel", { method: "POST", body: JSON.stringify({ clear_queue: false }) });
+        toast("正在取消当前传输（队列中的后续任务将继续执行）...", "warn");
       };
     }
+    const cAllBtn = root.querySelector("#btn-tr-cancel-all");
+    if (cAllBtn) {
+      cAllBtn.onclick = async () => {
+        if (!confirm("确定停止当前传输并清空所有排队中的任务吗？")) return;
+        await api("/api/transfer/cancel", { method: "POST", body: JSON.stringify({ clear_queue: true }) });
+        toast("已停止当前传输并清空队列", "warn");
+        pollTransferStatus();
+      };
+    }
+    const qClearBtn = root.querySelector("#btn-q-clear");
+    if (qClearBtn) {
+      qClearBtn.onclick = async () => {
+        await api("/api/transfer/queue/clear", { method: "POST" });
+        toast("已清空待发送队列", "ok");
+        pollTransferStatus();
+      };
+    }
+    root.querySelectorAll("[data-q-remove]").forEach((btn) => {
+      btn.onclick = async () => {
+        try {
+          await api("/api/transfer/queue/remove", {
+            method: "POST",
+            body: JSON.stringify({ job_id: btn.dataset.qRemove }),
+          });
+          toast("已从队列中移除", "ok");
+          pollTransferStatus();
+        } catch (e) {
+          toast(e.message, "error");
+        }
+      };
+    });
+    root.querySelectorAll("[data-q-promote]").forEach((btn) => {
+      btn.onclick = async () => {
+        try {
+          await api("/api/transfer/queue/promote", {
+            method: "POST",
+            body: JSON.stringify({ job_id: btn.dataset.qPromote }),
+          });
+          toast("已移至队首，下一项优先发送", "ok");
+          pollTransferStatus();
+        } catch (e) {
+          toast(e.message, "error");
+        }
+      };
+    });
   }
 
   async function renderSettingsView() {
@@ -2129,10 +2246,16 @@
       document.querySelectorAll("tr.selected").forEach((tr) => tr.classList.remove("selected"));
     });
 
-    document.getElementById("btn-send-selected").addEventListener("click", () => {
+    document.getElementById("btn-send-selected").addEventListener("click", async () => {
       const ids = Array.from(state.selectedTracks.keys());
       if (!ids.length) return;
-      startTransfer({ track_ids: ids, label: `发送已选 ${ids.length} 首曲目` });
+      const ok = await startTransfer({ track_ids: ids, label: `发送已选 ${ids.length} 首曲目` });
+      if (ok) {
+        state.selectedTracks.clear();
+        updateSelectionDock();
+        document.querySelectorAll(".row-check, #check-all-page").forEach((cb) => (cb.checked = false));
+        document.querySelectorAll("tr.selected").forEach((tr) => tr.classList.remove("selected"));
+      }
     });
 
     document.getElementById("btn-open-transfer-view").addEventListener("click", () => switchView("transfers"));

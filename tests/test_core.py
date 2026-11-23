@@ -369,3 +369,66 @@ def test_dedup_recycle_restore_and_organize(tmp_path: Path, monkeypatch):
     assert omgr.get_status()["status"] == "completed"
     assert (lib / "孙燕姿" / "The Moment" / "01 遇见.flac").is_file()
 
+
+def test_transfer_queue_sequential_and_manage(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("ECHO_SYNC_DATA_DIR", str(tmp_path / "qdata"))
+    db_path, meta_dir, _ = _create_mock_trim_music(tmp_path)
+    repo = TrimMusicRepo(str(db_path), str(meta_dir))
+
+    echo_mount = tmp_path / "mock_echo_q"
+    echo_mount.mkdir()
+    monkeypatch.setenv("ECHO_EXTRA_MOUNTS", str(echo_mount))
+
+    cfg_store = ConfigStore(tmp_path / "qcfg.json")
+    mgr = TransferManager(cfg_store)
+
+    # Hold the first task briefly using a monkeypatched copy hook so subsequent jobs reliably enqueue
+    import app.transfer as transfer_mod
+    import threading
+
+    gate = threading.Event()
+    orig_copy = transfer_mod.copy_file_atomic
+    first_started = threading.Event()
+
+    def slow_first_copy(src, dst, cancel_check=None):
+        if not first_started.is_set():
+            first_started.set()
+            gate.wait(timeout=3.0)
+        return orig_copy(src, dst, cancel_check)
+
+    monkeypatch.setattr(transfer_mod, "copy_file_atomic", slow_first_copy)
+
+    j1 = mgr.start_job(repo, [1], str(echo_mount), label="任务1")
+    assert j1["queued"] is False
+    assert first_started.wait(timeout=2.0)
+
+    j2 = mgr.start_job(repo, [2], str(echo_mount), label="任务2")
+    j3 = mgr.start_job(repo, [1], str(echo_mount), label="任务3-置顶")
+    j4 = mgr.start_job(repo, [2], str(echo_mount), label="任务4-移除")
+    assert j2["queued"] is True and j2["queue_position"] == 1
+    assert j3["queued"] is True and j3["queue_position"] == 2
+    assert j4["queued"] is True and j4["queue_position"] == 3
+
+    # Remove j4 and promote j3 to front
+    assert mgr.remove_queued_job(j4["id"]) is True
+    assert mgr.promote_queued_job(j3["id"]) is True
+
+    snap = mgr.get_status()
+    assert [q["id"] for q in snap["queue"]] == [j3["id"], j2["id"]]
+
+    # Release gate and let all queued jobs drain sequentially
+    gate.set()
+    for _ in range(150):
+        st = mgr.get_status()
+        if st["current"] and st["current"]["status"] != "running" and not st["queue"]:
+            break
+        time.sleep(0.05)
+
+    final_st = mgr.get_status()
+    assert final_st["queue"] == []
+    assert final_st["current"]["status"] == "completed"
+    # History is newest-first: j2 ran last, then j3, then j1
+    hist_labels = [h["label"] for h in final_st["history"]]
+    assert hist_labels[:3] == ["任务2", "任务3-置顶", "任务1"]
+
+
