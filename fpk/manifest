@@ -1,0 +1,16 @@
+appname               = echo-music-sync
+version               = 1.1.0
+display_name          = Echo 音乐传输
+desc                  = 依托于飞牛音乐（trim.music）的飞傲/Echo 播放器同步与曲库整理工具：支持浏览飞牛音乐曲库/专辑/歌手/喜欢/歌单并一键发送到 USB 外挂存储（自动携带刮削封面转基线 JPEG、LRC 歌词、规范标签、有声书归类、CUE 分轨与无损转码），并内置「曲库智能去重」（精确哈希去重 / 同曲多音质去重保留最高音质 / 同名文件去重）、「目录归档整理」、「空目录与系统垃圾清理」、「飞牛刮削封面歌词补齐到 NAS」以及可一键原路恢复的「安全回收站」。
+platform              = all
+source                = thirdparty
+maintainer            = vvlang
+maintainer_url        = https://github.com/vvlang/AIYeon
+distributor           = vvlang
+desktop_uidir         = ui
+desktop_applaunchname = echo-music-sync.main
+os_min_version        = 1.1.0
+ctl_stop              = true
+checkport             = false
+micro_app             = false
+changelog             = v1.1.0：重磅新增「曲库整理与智能去重」模块！支持精确哈希零误伤去重、同曲多音质智能去重（带时长校验防误杀、自动推荐保留 DSD/FLAC 最高音质）、同名文件去重、目录规范归档预览与执行、空目录与 macOS 残留/孤立歌词清理、NAS 曲库一键补齐飞牛刮削封面与 LRC，以及支持一键原路恢复的安全回收站。

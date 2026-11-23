@@ -1,0 +1,169 @@
+#!/bin/bash
+set -u
+
+APP_NAME="echo-music-sync"
+VAR_DIR="${TRIM_PKGVAR:-/var/apps/${APP_NAME}/var}"
+DEST_DIR="${TRIM_APPDEST:-/var/apps/${APP_NAME}/target}"
+LOG_FILE="${VAR_DIR}/app.log"
+PID_FILE="${VAR_DIR}/app.pid"
+SOCK_FILE="${DEST_DIR}/app.sock"
+VENV_DIR="${VAR_DIR}/venv"
+REQ_FILE="${DEST_DIR}/server/requirements.txt"
+WHEELS_DIR="${DEST_DIR}/server/vendor/wheels"
+DEPS_CHECK="import fastapi, uvicorn, mutagen, PIL"
+
+PYTHON="/usr/bin/python3"
+if [ ! -x "${PYTHON}" ]; then
+    PYTHON="$(command -v python3 || echo /usr/bin/python3)"
+fi
+
+mkdir -p "${VAR_DIR}"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+is_running() {
+    if [ ! -f "${PID_FILE}" ]; then
+        return 1
+    fi
+    local pid
+    pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+    if [ -z "${pid}" ] || ! [[ "${pid}" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    kill -0 "${pid}" 2>/dev/null
+}
+
+deps_ok() {
+    "${VENV_DIR}/bin/python" -c "${DEPS_CHECK}" 2>/dev/null
+}
+
+install_deps_offline() {
+    if [ ! -d "${WHEELS_DIR}" ]; then
+        return 1
+    fi
+    local count
+    count="$(find "${WHEELS_DIR}" -maxdepth 1 -name '*.whl' 2>/dev/null | wc -l)"
+    if [ "${count}" -eq 0 ]; then
+        return 1
+    fi
+    log_msg "离线安装内置依赖轮子 (${count} 个)..."
+    PIP_DISABLE_PIP_VERSION_CHECK=1 "${VENV_DIR}/bin/python" -m pip install \
+        --no-index --find-links "${WHEELS_DIR}" --no-cache-dir \
+        --disable-pip-version-check -r "${REQ_FILE}" >> "${LOG_FILE}" 2>&1
+}
+
+install_deps_online() {
+    for MIRROR in \
+        "https://mirrors.cloud.tencent.com/pypi/simple" \
+        "https://pypi.tuna.tsinghua.edu.cn/simple" \
+        "https://mirrors.aliyun.com/pypi/simple"; do
+        log_msg "在线兜底安装依赖: ${MIRROR}"
+        if PIP_DISABLE_PIP_VERSION_CHECK=1 "${VENV_DIR}/bin/python" -m pip install \
+            --timeout 25 --retries 1 --disable-pip-version-check \
+            -i "${MIRROR}" -r "${REQ_FILE}" >> "${LOG_FILE}" 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+prepare_venv() {
+    if [ ! -x "${VENV_DIR}/bin/python" ]; then
+        log_msg "创建 Python 虚拟环境: ${VENV_DIR} (使用 ${PYTHON})"
+        "${PYTHON}" -m venv "${VENV_DIR}" >> "${LOG_FILE}" 2>&1 || return 1
+    fi
+    if deps_ok; then
+        return 0
+    fi
+    if install_deps_offline && deps_ok; then
+        log_msg "依赖就绪（离线内置轮子）"
+        return 0
+    fi
+    log_msg "离线安装未命中，尝试在线兜底..."
+    if install_deps_online && deps_ok; then
+        log_msg "依赖就绪（在线兜底）"
+        return 0
+    fi
+    log_msg "依赖安装失败"
+    return 1
+}
+
+start_app() {
+    if is_running && [ -S "${SOCK_FILE}" ]; then
+        log_msg "服务已在运行中"
+        return 0
+    fi
+
+    if ! prepare_venv; then
+        echo "Python 依赖初始化失败，请查看日志 ${LOG_FILE}" > "${TRIM_TEMP_LOGFILE:-${VAR_DIR}/start-error.log}"
+        return 1
+    fi
+
+    rm -f "${SOCK_FILE}"
+    log_msg "启动 Echo 音乐传输服务 -> ${SOCK_FILE}"
+    TRIM_PKGVAR="${VAR_DIR}" \
+    TRIM_APPDEST="${DEST_DIR}" \
+    ECHO_GATEWAY_PREFIX="/app/${APP_NAME}" \
+        nohup "${VENV_DIR}/bin/python" "${DEST_DIR}/server/run_server.py" "${SOCK_FILE}" \
+        >> "${LOG_FILE}" 2>&1 &
+    local pid=$!
+    echo "${pid}" > "${PID_FILE}"
+
+    for _ in $(seq 1 100); do
+        if is_running && [ -S "${SOCK_FILE}" ]; then
+            chmod 666 "${SOCK_FILE}" 2>/dev/null || true
+            log_msg "启动成功 (PID=${pid})"
+            return 0
+        fi
+        sleep 0.15
+    done
+
+    log_msg "启动超时，服务未就绪"
+    stop_app
+    echo "Echo 音乐传输启动超时，请查看日志 ${LOG_FILE}" > "${TRIM_TEMP_LOGFILE:-${VAR_DIR}/start-error.log}"
+    return 1
+}
+
+stop_app() {
+    if [ -f "${PID_FILE}" ]; then
+        local pid
+        pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            log_msg "停止服务 (PID=${pid})"
+            kill -TERM "${pid}" 2>/dev/null || true
+            for _ in $(seq 1 40); do
+                if ! kill -0 "${pid}" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.1
+            done
+            if kill -0 "${pid}" 2>/dev/null; then
+                kill -KILL "${pid}" 2>/dev/null || true
+            fi
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    rm -f "${SOCK_FILE}"
+    return 0
+}
+
+case "${1:-}" in
+    start)
+        start_app
+        ;;
+    stop)
+        stop_app
+        ;;
+    status)
+        if is_running && [ -S "${SOCK_FILE}" ]; then
+            exit 0
+        fi
+        exit 3
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status}"
+        exit 1
+        ;;
+esac

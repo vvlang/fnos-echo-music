@@ -1,0 +1,14 @@
+{
+  ".url": {
+    "echo-music-sync.main": {
+      "title": "Echo 音乐传输",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/echo-music-sync",
+      "gatewaySocket": "app.sock",
+      "url": "/app/echo-music-sync/",
+      "allUsers": true
+    }
+  }
+}
